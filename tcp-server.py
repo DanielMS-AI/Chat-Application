@@ -10,19 +10,19 @@ def handle_connection(connection_socket, address):
 		# receive data in bytes
 		data = connection_socket.recv(1024)
 
+		# if no data is received, the connection is closed by the client
+		if not data:
+			print("Connection closed by", address)
+			break
+
 		# decode the received data to string and print out
 		message = data.decode()
 		print("Got message from", address, ":", message)
 
 		# convert it to uppercase and send back
 		connection_socket.send(message.upper().encode())
-
-		# stop checking messages and break
-		if message == "close":
-			break
 			
 	connection_socket.close()
-
 
 def main():
 	# create a listening socket
