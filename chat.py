@@ -2,6 +2,8 @@ import socket       # for TCP/UDP network communication
 import threading     # lets us run the listener and the input loop at the same time
 import sys           # lets us read command-line arguments (like the port number)
 
+connections = []
+
 
 def handle_connection(connection_socket, address):
     """
@@ -89,6 +91,41 @@ def get_my_ip():
     finally:
         temp_socket.close()
     return ip
+def connection(destination, port, my_port):
+    try:
+        socket.inet_pton(socket.AF_INET, destination)
+    except OSError:
+        return "Connection Failed: invalid IP Address"
+
+    try :
+        port = int(port)
+    except ValueError:
+        return "Connection Failed: invalid port number"
+
+    if destination == get_my_ip() and port == my_port:
+        return "Can't connect to yourself"
+
+    for connection in connections:
+        if connection["ip"] == destination and connection["port"] == port:
+            return "Connection Failed: Already connected to this address."
+
+    if len(connections) >= 3:
+        return "Connection Failed: Too many connections. Maximum 3 connections allowed."
+
+    peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    try:
+        peer_socket.connect((destination, port))
+    except (ConnectionRefusedError, TimeoutError, OSError) as error:
+        peer_socket.close()
+        return f"Connection Failed: {error}"
+
+    connections.append({"socket": peer_socket, "ip": destination, "port": port})
+
+    connection_thread = threading.Thread(target=handle_connection, args=(peer_socket, (destination, port)), daemon=True)
+    connection_thread.start()
+
+    return f"successfully connected to {destination} on port {port}."
 
 def main():
     # sys.argv is the list of words typed on the command line.
@@ -131,6 +168,18 @@ def main():
             # THIS process is listening on
             print("My listening port:", my_port)
             continue
+
+        if "connect" in message:
+            parts = message.strip().split()
+            if parts[0] == "connect":
+                if len(parts) != 3:
+                    print("Please connect in the following format: connect <destination> <port>")
+                    continue
+                destination, port = parts[1], parts[2]
+                result = connection(destination, port, my_port)
+                print(result)
+                continue
+
 
         if message.strip() == "exit":
             break
