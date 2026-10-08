@@ -1,191 +1,237 @@
-import socket       # for TCP/UDP network communication
-import threading     # lets us run the listener and the input loop at the same time
-import sys           # lets us read command-line arguments (like the port number)
+import socket       # TCP network communication
+import threading    # listen for peers while accepting keyboard commands
+import sys          # command-line arguments
 
 connections = []
+connections_lock = threading.Lock()
+next_connection_id = 1
 
 
-def handle_connection(connection_socket, address):
-    """
-    Runs in its own thread for EACH connected peer.
-    Keeps listening for messages from that one peer until they disconnect.
-    """
+def close_connection(peer):
+    """Remove a peer once, and wake up its blocked receiving thread."""
+    with connections_lock:
+        if peer not in connections:
+            return
+        connections.remove(peer)
+    try:
+        peer["socket"].shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # The other end may already have disconnected.
+    peer["socket"].close()
+    print(f"\nConnection {peer['id']} closed.")
+
+
+def handle_connection(peer):
+    """Receive complete lines, without automatically echoing them back."""
+    try:
+        # TCP can split or combine sends. A newline marks each whole message.
+        with peer["socket"].makefile("rb") as incoming:
+            for data in incoming:
+                message = data.rstrip(b"\n").decode("utf-8", errors="replace")
+                print(f"\nMessage from {peer['id']} ({peer['ip']}:{peer['port']}): {message}")
+    except OSError:
+        pass  # A disconnect or terminate command ends this receiver.
+    finally:
+        close_connection(peer)
+
+
+def register_connection(peer_socket, address):
+    """Track incoming and outgoing peers using IDs that never shift."""
+    global next_connection_id
+    with connections_lock:
+        if len(connections) >= 3:
+            peer_socket.close()
+            return None
+        peer = {
+            "id": next_connection_id,
+            "socket": peer_socket,
+            "ip": address[0],
+            "port": address[1],
+        }
+        next_connection_id += 1
+        connections.append(peer)
+    threading.Thread(target=handle_connection, args=(peer,), daemon=True).start()
+    return peer
+
+
+def listen_for_connections(listening_socket):
     while True:
-        # wait here until data arrives (or the peer disconnects)
-        data = connection_socket.recv(1024)
-
-        # recv() returns empty bytes (b'') when the other side has closed
-        # the connection -- this is how we detect a disconnect, NOT by
-        # looking for a special word like "exit" or "close"
-        if not data:
-            print("Connection closed by", address)
-            break
-
-        # convert the received bytes into a readable string
-        message = data.decode()
-        print("\nGot message from", address, ":", message)
-
-        # send a reply back (just uppercasing it for now, like before)
-        connection_socket.send(message.upper().encode())
-
-    # once the loop ends (peer disconnected), clean up this socket
-    connection_socket.close()
+        try:
+            peer_socket, address = listening_socket.accept()
+        except OSError:
+            return  # The listening socket was closed during shutdown.
+        peer = register_connection(peer_socket, address)
+        if peer is None:
+            print("\nConnection rejected: maximum 3 connections allowed.")
+        else:
+            print(f"\nGot connection {peer['id']} from {address}")
 
 
-def listen_for_connections(my_port):
-    """
-    Runs in a background thread for the ENTIRE lifetime of the program.
-    Sits and waits for new incoming connections, and spins up a new
-    handle_connection thread for each one that connects.
-    This is basically your old server.py's main(), just renamed.
-    """
-    listening_socket = socket.socket()
+def list_connections():
+    with connections_lock:
+        peers = list(connections)
+    if not peers:
+        print("No active connections.")
+        return
+    print(f"{'ID':<6}{'IP address':<18}Peer port")
+    for peer in peers:
+        print(f"{peer['id']:<6}{peer['ip']:<18}{peer['port']}")
+    # Incoming peer ports are source ports, not their listening ports.
 
-    # lets you restart the program quickly without "port already in use"
-    # errors (useful while testing/restarting often)
-    listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    # "" means "listen on all available network interfaces"
-    listening_socket.bind(("", my_port))
+def find_connection(connection_id):
+    try:
+        connection_id = int(connection_id)
+    except ValueError:
+        return None
+    with connections_lock:
+        return next((peer for peer in connections if peer["id"] == connection_id), None)
 
-    # 10 = how many pending connections can queue up before being accepted
-    listening_socket.listen(10)
 
-    while True:
-        # blocks here until someone connects to us
-        connection_socket, address = listening_socket.accept()
-        print("\nGot connection from", address)
+def send_message(connection_id, message):
+    peer = find_connection(connection_id)
+    if peer is None:
+        return "Invalid connection ID. Use 'list' to see active connections."
+    if not message.strip():
+        return "Message cannot be empty."
+    try:
+        peer["socket"].sendall((message + "\n").encode("utf-8"))
+    except OSError as error:
+        close_connection(peer)
+        return f"Message failed: {error}"
+    return f"Message sent to connection {peer['id']}."
 
-        # hand this specific peer off to its own thread, so we can go
-        # right back to accept()-ing the NEXT incoming connection
-        # without waiting on this one
-        t = threading.Thread(
-            target=handle_connection,
-            args=(connection_socket, address),
-            daemon=True  # dies automatically when the main program exits
-        )
-        t.start()
+
+def terminate_connection(connection_id):
+    peer = find_connection(connection_id)
+    if peer is None:
+        return "Invalid connection ID. Use 'list' to see active connections."
+    close_connection(peer)
+    return f"Terminated connection {peer['id']}."
+
 
 def print_help():
     print("""
 Available commands:
   help                          - Show this help message
   myip                          - Display this process's IP address
-  myport                        - Display the port this process is listening on
-  connect <destination> <port>  - Connect to a peer at the given IP and port
-  list                          - List all current connections
-  terminate <connection id>     - Terminate the specified connection
-  send <connection id> <msg>    - Send a message to the specified connection
-  exit                          - Close all connections and terminate
+  myport                        - Display the listening port
+  connect <destination> <port>  - Connect to a peer's IPv4 address and port
+  list                          - List connection IDs, IP addresses, and peer ports
+  terminate <connection id>     - Close the specified connection
+  send <connection id> <msg>    - Send a message (spaces allowed)
+  message <connection id> <msg> - Alias for send
+  exit                          - Close all connections and quit
 """)
 
+
 def get_my_ip():
-    # Open a throwaway UDP socket and "connect" to an external address.
-    # No data is actually sent -- this just asks the OS which real
-    # network interface it would use, so we get the actual local IP
-    # instead of 127.0.0.1.
-    temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        temp_socket.connect(("8.8.8.8", 80))
-        ip = temp_socket.getsockname()[0]
-    finally:
-        temp_socket.close()
-    return ip
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as temp_socket:
+        try:
+            temp_socket.connect(("8.8.8.8", 80))
+            return temp_socket.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"  # Local testing still works without a network.
+
+
 def connection(destination, port, my_port):
     try:
         socket.inet_pton(socket.AF_INET, destination)
     except OSError:
-        return "Connection Failed: invalid IP Address"
-
-    try :
+        return "Connection Failed: invalid IP address"
+    try:
         port = int(port)
+        if not 1 <= port <= 65535:
+            raise ValueError
     except ValueError:
-        return "Connection Failed: invalid port number"
+        return "Connection Failed: port must be between 1 and 65535"
 
-    if destination == get_my_ip() and port == my_port:
+    if port == my_port and (destination.startswith("127.") or destination == get_my_ip()):
         return "Can't connect to yourself"
-
-    for connection in connections:
-        if connection["ip"] == destination and connection["port"] == port:
+    with connections_lock:
+        if any(peer["ip"] == destination and peer["port"] == port for peer in connections):
             return "Connection Failed: Already connected to this address."
-
-    if len(connections) >= 3:
-        return "Connection Failed: Too many connections. Maximum 3 connections allowed."
+        if len(connections) >= 3:
+            return "Connection Failed: maximum 3 connections allowed."
 
     peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
     try:
+        peer_socket.settimeout(5)
         peer_socket.connect((destination, port))
-    except (ConnectionRefusedError, TimeoutError, OSError) as error:
+        peer_socket.settimeout(None)
+    except OSError as error:
         peer_socket.close()
         return f"Connection Failed: {error}"
+    peer = register_connection(peer_socket, (destination, port))
+    if peer is None:
+        return "Connection Failed: maximum 3 connections allowed."
+    return f"Successfully connected to {destination} on port {port}. Connection ID: {peer['id']}."
 
-    connections.append({"socket": peer_socket, "ip": destination, "port": port})
-
-    connection_thread = threading.Thread(target=handle_connection, args=(peer_socket, (destination, port)), daemon=True)
-    connection_thread.start()
-
-    return f"successfully connected to {destination} on port {port}."
 
 def main():
-    # sys.argv is the list of words typed on the command line.
-    # sys.argv[0] is always the script name itself (e.g. "chat.py"),
-    # so sys.argv[1] is the FIRST actual argument -- our port number.
-    # Example: running `python3 chat.py 4545` means sys.argv == ["chat.py", "4545"]
     if len(sys.argv) != 2:
-        print("Usage: python3 chat.py <port>")
-        sys.exit(1)  # stop the program immediately with an error status
+        print("Usage: python chat.py <port>")
+        return 1
+    try:
+        my_port = int(sys.argv[1])
+        if not 1 <= my_port <= 65535:
+            raise ValueError
+    except ValueError:
+        print("Port must be a number between 1 and 65535.")
+        return 1
 
-    # command-line arguments always arrive as strings, so convert to int
-    my_port = int(sys.argv[1])
-
-    # start the listening loop in the BACKGROUND, so it runs at the same
-    # time as the input loop below, instead of blocking everything else.
-    # Without this thread, the program would get stuck inside
-    # listen_for_connections() forever and never reach the input loop.
-    listener_thread = threading.Thread(
-        target=listen_for_connections,
-        args=(my_port,),
-        daemon=True
-    )
-    listener_thread.start()
-
-    print(f"Listening on port {my_port}. Type 'exit' to quit.")
-
-    while True:
-        message = input("Enter a command (e.g., 'help' for options):")
-
-        if message.strip() == "help":
-            print_help()
-            continue
-
-        if message.strip() == "myip":
-            print("My IP address:", get_my_ip())
-            continue
-
-        if message.strip() == "myport":
-            # now this is CORRECT -- my_port is the real port
-            # THIS process is listening on
-            print("My listening port:", my_port)
-            continue
-
-        if "connect" in message:
-            parts = message.strip().split()
-            if parts[0] == "connect":
-                if len(parts) != 3:
-                    print("Please connect in the following format: connect <destination> <port>")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listening_socket:
+        try:
+            listening_socket.bind(("", my_port))
+            listening_socket.listen(10)
+        except OSError as error:
+            print(f"Could not listen on port {my_port}: {error}")
+            return 1
+        threading.Thread(target=listen_for_connections, args=(listening_socket,), daemon=True).start()
+        print(f"Listening on port {my_port}. Type 'help' for commands or 'exit' to quit.")
+        try:
+            while True:
+                parts = input("Enter a command: ").strip().split(maxsplit=2)
+                if not parts:
                     continue
-                destination, port = parts[1], parts[2]
-                result = connection(destination, port, my_port)
-                print(result)
-                continue
-
-
-        if message.strip() == "exit":
-            break
-
-        print("(connect/list/terminate/send not implemented yet)")
-
+                command = parts[0]
+                if command == "help":
+                    print_help()
+                elif command == "myip":
+                    print("My IP address:", get_my_ip())
+                elif command == "myport":
+                    print("My listening port:", my_port)
+                elif command == "list":
+                    list_connections()
+                elif command == "connect":
+                    if len(parts) != 3:
+                        print("Usage: connect <destination> <port>")
+                    else:
+                        print(connection(parts[1], parts[2], my_port))
+                elif command in ("send", "message"):
+                    if len(parts) != 3:
+                        print(f"Usage: {command} <connection id> <message>")
+                    else:
+                        print(send_message(parts[1], parts[2]))
+                elif command == "terminate":
+                    if len(parts) != 2:
+                        print("Usage: terminate <connection id>")
+                    else:
+                        print(terminate_connection(parts[1]))
+                elif command == "exit":
+                    break
+                else:
+                    print("Unknown command. Type 'help' for options.")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            with connections_lock:
+                peers = list(connections)
+            for peer in peers:
+                close_connection(peer)
     print("Goodbye.")
+    return 0
 
-main()
+
+if __name__ == "__main__":
+    sys.exit(main())
